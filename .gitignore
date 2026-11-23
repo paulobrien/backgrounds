@@ -1,0 +1,8 @@
+# Local build products and downloaded source dependencies
+/build/
+/.build-deps/
+
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+.venv/
