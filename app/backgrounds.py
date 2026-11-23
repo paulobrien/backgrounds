@@ -18,6 +18,7 @@ import subprocess
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from typing import BinaryIO
 
 from PIL import Image, ImageOps, ImageTk
 
@@ -68,6 +69,47 @@ class FrameWriter:
     def close(self):
         self.mapping.close()
         self.kernel.CloseHandle(self.mutex)
+
+
+class LatestFrameReader:
+    """Drain a buffered raw-video pipe without queuing stale frames."""
+
+    def __init__(self, pipe: BinaryIO, frame_size: int, stop_event: threading.Event):
+        self.pipe = pipe
+        self.frame_size = frame_size
+        self.stop_event = stop_event
+        self.ready = threading.Condition()
+        self.latest: bytes | None = None
+        self.finished = False
+        self.error: OSError | None = None
+
+    def drain(self):
+        try:
+            while not self.stop_event.is_set():
+                frame = self.pipe.read(self.frame_size)
+                if len(frame) != self.frame_size:
+                    break
+                with self.ready:
+                    self.latest = frame
+                    self.ready.notify()
+        except OSError as error:
+            self.error = error
+        finally:
+            with self.ready:
+                self.finished = True
+                self.ready.notify()
+
+    def take(self) -> bytes | None:
+        with self.ready:
+            self.ready.wait_for(lambda: self.latest is not None or self.finished or self.stop_event.is_set())
+            if self.stop_event.is_set():
+                return None
+            if self.latest is not None:
+                frame, self.latest = self.latest, None
+                return frame
+            if self.error is not None:
+                raise self.error
+            return None
 
 
 class OverlayCache:
@@ -238,6 +280,7 @@ class Application:
         command += ["-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
                     "-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"]
         error_file = None
+        reader_thread = None
         try:
             # Capture stderr without blocking the FFmpeg process or hiding useful startup errors.
             import tempfile
@@ -247,11 +290,14 @@ class Application:
                 self.proc = proc
                 if self.stop_event.is_set():
                     self.terminate_process(proc)
+            reader = LatestFrameReader(proc.stdout, WIDTH * HEIGHT * 3, self.stop_event)
+            reader_thread = threading.Thread(target=reader.drain, daemon=True)
+            reader_thread.start()
             frames = 0
             overlay_cache = OverlayCache()
             while not self.stop_event.is_set():
-                data = proc.stdout.read(WIDTH * HEIGHT * 3)
-                if len(data) != WIDTH * HEIGHT * 3:
+                data = reader.take()
+                if data is None:
                     break
                 with self.options_lock:
                     options = self.options.copy()
@@ -287,6 +333,8 @@ class Application:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
+                if reader_thread is not None:
+                    reader_thread.join()
                 proc.stdout.close()
             if error_file:
                 error_file.close()

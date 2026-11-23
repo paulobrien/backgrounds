@@ -1,4 +1,5 @@
 """Run with: python -m unittest discover -s tests -v"""
+from io import BytesIO
 import os
 from pathlib import Path
 import queue
@@ -38,6 +39,21 @@ class CompositingTests(unittest.TestCase):
         self.assertEqual(resized.size, (320, 160))
         self.assertEqual(resized.getpixel((0, 0))[3], 64)
         self.assertIsNot(cache.get(overlay, 25, 100), resized)
+
+
+class LatestFrameReaderTests(unittest.TestCase):
+    def test_slow_consumer_gets_latest_complete_frame_only(self):
+        reader = b.LatestFrameReader(BytesIO(b"1112223334"), 3, threading.Event())
+        reader.drain()
+        self.assertEqual(reader.take(), b"333")
+        self.assertIsNone(reader.take())
+
+    def test_stop_discards_pending_frame(self):
+        stop = threading.Event()
+        reader = b.LatestFrameReader(BytesIO(b"123"), 3, stop)
+        reader.drain()
+        stop.set()
+        self.assertIsNone(reader.take())
 
 
 @unittest.skipUnless(os.name == "nt", "Windows shared memory is required")
