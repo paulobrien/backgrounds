@@ -1,8 +1,11 @@
 [CmdletBinding()]
 param(
-    [string] $DllPath = (Join-Path $PSScriptRoot '..\dist\BackgroundsCamera.dll')
+    [string] $DllPath
 )
 $ErrorActionPreference = 'Stop'
+if (-not $DllPath) {
+    $DllPath = Join-Path $PSScriptRoot '..\dist\BackgroundsCamera.dll'
+}
 if (-not [Environment]::Is64BitOperatingSystem) { throw 'This build requires 64-bit Windows.' }
 if (-not (Test-Path -LiteralPath $DllPath -PathType Leaf)) { throw "Camera DLL not found: $DllPath. Build it first; see native\virtual-camera\README.md." }
 $licensePath = Join-Path $PSScriptRoot '..\dist\MICROSOFT-WINDOWS-CLASSIC-SAMPLES-LICENSE.txt'

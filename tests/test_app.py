@@ -10,6 +10,8 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 import backgrounds as b
@@ -31,6 +33,15 @@ class CompositingTests(unittest.TestCase):
         options = dict(overlay=None, x=0, y=0, size=5, opacity=100, mirror=True, grayscale=True)
         result = b.composite(image, options)
         self.assertEqual(result.getpixel((b.WIDTH - 1, 0)), (76, 76, 76))
+
+    def test_rgba_composite_preserves_mode(self):
+        image = Image.new("RGBA", (b.WIDTH, b.HEIGHT), (0, 0, 255, 255))
+        options = dict(overlay=Image.new("RGBA", (1, 1), (255, 0, 0, 128)),
+                       x=0, y=0, size=5, opacity=100, mirror=False, grayscale=False)
+        result = b.composite(image, options)
+        self.assertEqual(result.mode, "RGBA")
+        self.assertEqual(result.getpixel((0, 0))[:3], (128, 0, 127))
+        self.assertEqual(result.getpixel((100, 100))[:3], (0, 0, 255))
 
     def test_overlay_cache_reuses_resize_and_invalidates_on_changes(self):
         overlay = Image.new("RGBA", (16, 8), (255, 0, 0, 128))
@@ -56,6 +67,43 @@ class LatestFrameReaderTests(unittest.TestCase):
         stop.set()
         self.assertIsNone(reader.take())
 
+    def test_wake_unblocks_waiting_consumer(self):
+        stop = threading.Event()
+        reader = b.LatestFrameReader(BytesIO(b""), 3, stop)
+        result = []
+        thread = threading.Thread(target=lambda: result.append(reader.take()), daemon=True)
+        thread.start()
+        time.sleep(0.05)
+        stop.set()
+        reader.wake()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [None])
+
+
+class CameraDiscoveryTests(unittest.TestCase):
+    def test_list_cameras_filters_audio_alternatives_and_virtual_camera(self):
+        sample_output = "\n".join([
+            '[dshow @ 0000] "Integrated Webcam" (video)',
+            '[dshow @ 0000]   Alternative name "@device_pnp_123"',
+            '[dshow @ 0000] "Backgrounds Virtual Camera" (video)',
+            '[dshow @ 0000] "Backgrounds Real Cam" (none)',
+            '[dshow @ 0000] "Microphone" (audio)',
+            '[dshow @ 0000] "Integrated Webcam" (video)',
+        ])
+        completed = mock.Mock(stdout="", stderr=sample_output)
+        with mock.patch.object(b.subprocess, "run", return_value=completed):
+            self.assertEqual(b.list_cameras("ffmpeg"), ["Integrated Webcam", "Backgrounds Real Cam"])
+
+    def test_build_ffmpeg_command_modes(self):
+        preferred = b.build_ffmpeg_command("ffmpeg", "Integrated Webcam", request_mode=True)
+        fallback = b.build_ffmpeg_command("ffmpeg", "Integrated Webcam", request_mode=False)
+        test_cmd = b.build_ffmpeg_command("ffmpeg", b.TEST_SOURCE)
+        self.assertIn("-video_size", preferred)
+        self.assertNotIn("-video_size", fallback)
+        self.assertIn("rgba", preferred)
+        self.assertIn("lavfi", test_cmd)
+
 
 class SettingsTests(unittest.TestCase):
     def setUp(self):
@@ -80,6 +128,16 @@ class SettingsTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows shared memory is required")
 class SharedMemoryTests(unittest.TestCase):
+    def setUp(self):
+        suffix = uuid.uuid4().hex
+        patches = (
+            mock.patch.object(b, "MAP_NAME", f"{b.MAP_NAME}_Test_{suffix}"),
+            mock.patch.object(b, "MUTEX_NAME", f"{b.MUTEX_NAME}_Test_{suffix}"),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_header_and_bottom_up_bgra(self):
         image = Image.new("RGB", (b.WIDTH, b.HEIGHT))
         image.putpixel((0, 0), (1, 2, 3))
@@ -101,10 +159,11 @@ class SharedMemoryTests(unittest.TestCase):
         app = b.Application.__new__(b.Application)
         app.ffmpeg = shutil.which("ffmpeg")
         app.proc = None
+        app.reader = None
         app.stop_event = threading.Event()
         app.process_lock = threading.Lock()
         app.options_lock = threading.Lock()
-        app.options = dict(overlay=None, x=0, y=0, size=5, opacity=100, mirror=False, grayscale=False)
+        app.options = dict(overlay=None, x=0, y=0, size=5, opacity=100, mirror=False, grayscale=False, preview=False)
         app.preview = queue.Queue(maxsize=1)
         app.messages = queue.Queue()
         app.writer = b.FrameWriter()
@@ -120,10 +179,13 @@ class SharedMemoryTests(unittest.TestCase):
             with app.process_lock:
                 if app.proc:
                     app.terminate_process(app.proc)
+                if app.reader:
+                    app.reader.wake()
             worker.join(timeout=8)
             if not worker.is_alive():
                 app.writer.close()
         self.assertFalse(worker.is_alive(), "Capture thread did not stop")
+        self.assertTrue(app.preview.empty(), "Preview queue should stay empty when preview is disabled")
         messages = []
         while not app.messages.empty():
             messages.append(app.messages.get_nowait())

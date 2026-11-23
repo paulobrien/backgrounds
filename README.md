@@ -34,6 +34,17 @@ The app prioritizes fresh video: if processing falls behind, it skips pending fr
 
 Settings are saved when the app closes and restored at startup. They are stored in `%APPDATA%\BackgroundsCamera\settings.json` and include the camera, overlay image path, slider positions, effects and preview choice. If the saved camera or image is unavailable, the app falls back to its defaults.
 
+## Standalone executable (optional)
+
+To avoid running Python manually, you can package the app into `dist\BackgroundsCamera.exe` with PyInstaller:
+
+```powershell
+py -3 -m pip install --user pyinstaller
+powershell -ExecutionPolicy Bypass -File .\scripts\build-exe.ps1
+```
+
+Pass `-BundleFfmpeg` (or `-FfmpegPath <path-to-ffmpeg.exe>`) to include `ffmpeg.exe` inside the executable so end users do not need FFmpeg on `PATH` either. Note that redistributing a bundled FFmpeg binary is subject to that FFmpeg build's license.
+
 ## Uninstall the virtual camera
 
 Close the app and any applications using the virtual camera, then in ordinary PowerShell run:
@@ -42,7 +53,7 @@ Close the app and any applications using the virtual camera, then in ordinary Po
 powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-camera.ps1
 ```
 
-This removes the per-user virtual camera, not Python, Pillow or FFmpeg. Remove the repository folder separately if no longer needed.
+This removes the per-user virtual camera, not Python, Pillow or FFmpeg. Saved app settings remain in `%APPDATA%\BackgroundsCamera\settings.json` and can be deleted manually if you want a clean removal. Remove the repository folder separately if no longer needed.
 
 ## Tests
 
