@@ -53,7 +53,7 @@ class FrameWriter:
 
     def write(self, image: Image.Image):
         # DirectShow RGB32 is bottom-up, with BGRA byte order.
-        frame = image.convert("RGBA").transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes("raw", "BGRA")
+        frame = image.convert("RGBA").tobytes("raw", "BGRA", 0, -1)
         result = self.kernel.WaitForSingleObject(self.mutex, 1000)
         if result not in (0, 0x80):  # success or abandoned mutex
             raise RuntimeError("Could not lock the virtual camera frame buffer")
@@ -68,6 +68,24 @@ class FrameWriter:
     def close(self):
         self.mapping.close()
         self.kernel.CloseHandle(self.mutex)
+
+
+class OverlayCache:
+    def __init__(self):
+        self.source = None
+        self.size = None
+        self.opacity = None
+        self.image = None
+
+    def get(self, overlay: Image.Image, size: int, opacity: int) -> Image.Image:
+        if self.source is not overlay or self.size != size or self.opacity != opacity:
+            target_width = max(1, round(WIDTH * size / 100))
+            target_height = max(1, round(overlay.height * target_width / overlay.width))
+            image = overlay.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            if opacity < 100:
+                image.putalpha(image.getchannel("A").point(lambda value: value * opacity // 100))
+            self.source, self.size, self.opacity, self.image = overlay, size, opacity, image
+        return self.image
 
 
 def list_cameras(ffmpeg: str) -> list[str]:
@@ -85,20 +103,16 @@ def list_cameras(ffmpeg: str) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def composite(image: Image.Image, options: dict) -> Image.Image:
+def composite(image: Image.Image, options: dict, overlay_cache: OverlayCache | None = None) -> Image.Image:
     if options["mirror"]:
         image = ImageOps.mirror(image)
     if options["grayscale"]:
         image = ImageOps.grayscale(image).convert("RGB")
     overlay = options.get("overlay")
     if overlay is not None:
-        target_width = max(1, round(WIDTH * options["size"] / 100))
-        target_height = max(1, round(overlay.height * target_width / overlay.width))
-        resized = overlay.resize((target_width, target_height), Image.Resampling.LANCZOS)
-        if options["opacity"] < 100:
-            resized.putalpha(resized.getchannel("A").point(lambda v: v * options["opacity"] // 100))
-        x = round((WIDTH - target_width) * options["x"] / 100)
-        y = round((HEIGHT - target_height) * options["y"] / 100)
+        resized = (overlay_cache or OverlayCache()).get(overlay, options["size"], options["opacity"])
+        x = round((WIDTH - resized.width) * options["x"] / 100)
+        y = round((HEIGHT - resized.height) * options["y"] / 100)
         image.paste(resized, (x, y), resized)
     return image
 
@@ -220,9 +234,9 @@ class Application:
         if camera == TEST_SOURCE:
             command += ["-re", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30"]
         else:
-            command += ["-f", "dshow", "-i", "video=" + camera]
+            command += ["-thread_queue_size", "1", "-rtbufsize", "16M", "-f", "dshow", "-i", "video=" + camera]
         command += ["-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-                    "-r", "30", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"]
+                    "-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"]
         error_file = None
         try:
             # Capture stderr without blocking the FFmpeg process or hiding useful startup errors.
@@ -234,23 +248,25 @@ class Application:
                 if self.stop_event.is_set():
                     self.terminate_process(proc)
             frames = 0
+            overlay_cache = OverlayCache()
             while not self.stop_event.is_set():
                 data = proc.stdout.read(WIDTH * HEIGHT * 3)
                 if len(data) != WIDTH * HEIGHT * 3:
                     break
                 with self.options_lock:
                     options = self.options.copy()
-                image = composite(Image.frombytes("RGB", (WIDTH, HEIGHT), data), options)
+                image = composite(Image.frombytes("RGB", (WIDTH, HEIGHT), data), options, overlay_cache)
                 self.writer.write(image)
-                image.thumbnail((800, 450), Image.Resampling.BILINEAR)
-                try:
-                    self.preview.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self.preview.put_nowait(image)
-                except queue.Full:
-                    pass
+                if frames % 3 == 0:
+                    image.thumbnail((800, 450), Image.Resampling.BILINEAR)
+                    try:
+                        self.preview.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.preview.put_nowait(image)
+                    except queue.Full:
+                        pass
                 frames += 1
                 if frames == 1:
                     self.messages.put(("status", "Streaming. Select Backgrounds Camera in your video application."))

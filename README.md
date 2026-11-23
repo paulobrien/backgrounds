@@ -30,6 +30,8 @@ The camera installer registers the included native DLL for the current user; con
 
 The app must remain running while it supplies video. Close or stop another program that has exclusive use of the physical webcam if capture fails. The current output is fixed at 1280 × 720, nominally 30 fps; actual frame rate depends on the machine. The virtual camera emits black frames while the app is not streaming.
 
+The in-app preview updates from every third processed frame (about 10 fps with a 30 fps source) to leave more processing time for the virtual-camera feed. The feed keeps the source frame rate rather than duplicating frames to reach 30 fps.
+
 ## Uninstall the virtual camera
 
 Close the app and any applications using the virtual camera, then in ordinary PowerShell run:

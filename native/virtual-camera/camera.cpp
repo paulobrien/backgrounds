@@ -15,11 +15,20 @@ static constexpr wchar_t kCategory[] = L"{860BB310-5D01-11D0-BD3B-00A0C911CE86}"
 static constexpr DWORD kWidth = 1280, kHeight = 720, kBytes = kWidth*kHeight*4;
 static constexpr REFERENCE_TIME kFrameTime = 333333;
 static HMODULE g_module;
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 class CameraStream final : public CSourceStream, public IAMStreamConfig, public IKsPropertySet {
 public:
     CameraStream(HRESULT* result, CSource* parent)
-        : CSourceStream(NAME("Backgrounds stream"), result, parent, L"Capture") {}
+        : CSourceStream(NAME("Backgrounds stream"), result, parent, L"Capture") {
+        timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!timer_) timer_ = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    }
+    ~CameraStream() override {
+        if (timer_) CloseHandle(timer_);
+    }
     DECLARE_IUNKNOWN;
     STDMETHODIMP NonDelegatingQueryInterface(REFIID iid, void** object) override {
         if (iid == IID_IAMStreamConfig) return GetInterface(static_cast<IAMStreamConfig*>(this), object);
@@ -66,38 +75,44 @@ public:
         if (FAILED(hr)) return hr;
         return actual.cbBuffer >= static_cast<LONG>(kBytes) ? S_OK : E_FAIL;
     }
-    HRESULT OnThreadCreate() override { next_ = 0; return S_OK; }
+    HRESULT OnThreadCreate() override {
+        next_ = 0;
+        if (!QueryPerformanceFrequency(&frequency_) || !QueryPerformanceCounter(&nextFrame_)) return E_FAIL;
+        return S_OK;
+    }
     HRESULT FillBuffer(IMediaSample* sample) override {
         if (!sample) return E_POINTER;
         BYTE* output = nullptr;
         HRESULT hr = sample->GetPointer(&output);
         if (FAILED(hr)) return hr;
         if (sample->GetSize() < static_cast<LONG>(kBytes)) return E_FAIL;
-        ZeroMemory(output, kBytes);
-        HANDLE map = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Local\\BackgroundsCameraFrame");
+        PaceFrame();
+        bool copied = false;
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"Local\\BackgroundsCameraFrame");
         HANDLE mutex = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, L"Local\\BackgroundsCameraMutex");
-        if (map && mutex) {
+        if (mapping && mutex) {
             DWORD wait = WaitForSingleObject(mutex, 20);
             if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
-                const BYTE* view = static_cast<const BYTE*>(MapViewOfFile(map, FILE_MAP_READ, 0, 0, 16 + kBytes));
+                const BYTE* view = static_cast<const BYTE*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 16 + kBytes));
                 if (view) {
                     const DWORD* header = reinterpret_cast<const DWORD*>(view);
-                    if (header[0] == 0x42474331 && header[1] == kWidth && header[2] == kHeight)
+                    if (header[0] == 0x42474331 && header[1] == kWidth && header[2] == kHeight) {
                         memcpy(output, view + 16, kBytes);
+                        copied = true;
+                    }
                     UnmapViewOfFile(view);
                 }
                 ReleaseMutex(mutex);
             }
         }
         if (mutex) CloseHandle(mutex);
-        if (map) CloseHandle(map);
+        if (mapping) CloseHandle(mapping);
+        if (!copied) ZeroMemory(output, kBytes);
         REFERENCE_TIME start = next_, end = start + kFrameTime;
         next_ = end;
         sample->SetTime(&start, &end);
         sample->SetActualDataLength(kBytes);
         sample->SetSyncPoint(TRUE);
-        // The producer is live. Pace delivery even when the downstream filter does not.
-        Sleep(33);
         return S_OK;
     }
     STDMETHODIMP SetFormat(AM_MEDIA_TYPE* type) override {
@@ -149,6 +164,36 @@ public:
         *support = KSPROPERTY_SUPPORT_GET; return S_OK;
     }
 private:
+    void PaceFrame() {
+        LARGE_INTEGER now{};
+        if (!frequency_.QuadPart || !QueryPerformanceCounter(&now)) return;
+        if (now.QuadPart < nextFrame_.QuadPart) {
+            const LONGLONG remaining = nextFrame_.QuadPart - now.QuadPart;
+            bool waited = false;
+            if (timer_) {
+                LARGE_INTEGER due{};
+                due.QuadPart = -((remaining * 10000000 + frequency_.QuadPart - 1) / frequency_.QuadPart);
+                if (SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE))
+                    waited = WaitForSingleObject(timer_, INFINITE) == WAIT_OBJECT_0;
+            }
+            if (!waited) {
+                const DWORD sleepMs = static_cast<DWORD>(remaining * 1000 / frequency_.QuadPart);
+                if (sleepMs > 1) Sleep(sleepMs - 1);
+                do {
+                    SwitchToThread();
+                    QueryPerformanceCounter(&now);
+                } while (now.QuadPart < nextFrame_.QuadPart);
+            }
+            QueryPerformanceCounter(&now);
+        }
+        const LONGLONG interval = frequency_.QuadPart * kFrameTime / 10000000;
+        nextFrame_.QuadPart += interval;
+        if (nextFrame_.QuadPart <= now.QuadPart) nextFrame_.QuadPart = now.QuadPart + interval;
+    }
+
+    HANDLE timer_ = nullptr;
+    LARGE_INTEGER frequency_{};
+    LARGE_INTEGER nextFrame_{};
     REFERENCE_TIME next_ = 0;
 };
 

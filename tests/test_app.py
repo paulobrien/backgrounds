@@ -30,6 +30,15 @@ class CompositingTests(unittest.TestCase):
         result = b.composite(image, options)
         self.assertEqual(result.getpixel((b.WIDTH - 1, 0)), (76, 76, 76))
 
+    def test_overlay_cache_reuses_resize_and_invalidates_on_changes(self):
+        overlay = Image.new("RGBA", (16, 8), (255, 0, 0, 128))
+        cache = b.OverlayCache()
+        resized = cache.get(overlay, 25, 50)
+        self.assertIs(cache.get(overlay, 25, 50), resized)
+        self.assertEqual(resized.size, (320, 160))
+        self.assertEqual(resized.getpixel((0, 0))[3], 64)
+        self.assertIsNot(cache.get(overlay, 25, 100), resized)
+
 
 @unittest.skipUnless(os.name == "nt", "Windows shared memory is required")
 class SharedMemoryTests(unittest.TestCase):
