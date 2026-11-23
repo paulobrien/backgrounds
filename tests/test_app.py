@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import tkinter as tk
 import unittest
 from unittest import mock
 import uuid
@@ -113,7 +114,7 @@ class SettingsTests(unittest.TestCase):
     def test_round_trip(self):
         path = self.folder / "nested" / "settings.json"
         saved = dict(b.DEFAULT_SETTINGS, camera="Integrated Webcam", overlay_path="C:\\logo.png", x=10,
-                     size=40, mirror=True, show_preview=False)
+                     size=40, mirror=True, show_preview=False, start_minimized=True)
         b.save_settings(saved, path)
         self.assertEqual(b.load_settings(path), saved)
 
@@ -124,6 +125,87 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(b.load_settings(path), b.DEFAULT_SETTINGS)
         path.write_text('{"size": 500, "opacity": "high", "mirror": 1, "camera": 3, "x": true}', encoding="utf-8")
         self.assertEqual(b.load_settings(path), dict(b.DEFAULT_SETTINGS, size=100))
+
+
+@unittest.skipUnless(os.name == "nt", "Windows system tray is required")
+class TrayTests(unittest.TestCase):
+    def setUp(self):
+        self.settings = dict(b.DEFAULT_SETTINGS)
+        self.root = tk.Tk()
+        self.addCleanup(self.destroy_root)
+        patches = (
+            mock.patch.object(b, "load_settings", side_effect=lambda: self.settings.copy()),
+            mock.patch.object(b, "save_settings"),
+            mock.patch.object(b, "FrameWriter"),
+            mock.patch.object(b, "find_ffmpeg", return_value=None),
+            mock.patch.object(b.pystray, "Icon"),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def destroy_root(self):
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def make_app(self):
+        app = b.Application(self.root)
+        app.tray_started.set()
+        return app
+
+    def test_minimize_and_restore_suspend_preview_without_changing_preference(self):
+        app = self.make_app()
+        app.handle_tray("ready")
+        app.hide_window()
+        self.assertFalse(app.options["preview"])
+        self.assertTrue(app.show_preview.get())
+        self.assertEqual(self.root.state(), "withdrawn")
+        app.handle_tray("show")
+        self.assertTrue(app.options["preview"])
+        self.assertNotEqual(self.root.state(), "withdrawn")
+        app.close()
+
+    def test_start_minimized_and_second_launch_restore(self):
+        self.settings["start_minimized"] = True
+        app = self.make_app()
+        app.handle_tray("ready")
+        self.assertEqual(self.root.state(), "withdrawn")
+        app.messages.put(("tray", "show"))
+        app.poll()
+        self.assertNotEqual(self.root.state(), "withdrawn")
+        self.assertTrue(app.current_settings()["start_minimized"])
+        app.close()
+
+    def test_show_before_tray_ready_does_not_hide_window(self):
+        self.settings["start_minimized"] = True
+        app = self.make_app()
+        app.handle_tray("show")
+        app.handle_tray("ready")
+        self.assertNotEqual(self.root.state(), "withdrawn")
+        app.close()
+
+    def test_tray_start_can_restart_after_stop(self):
+        app = self.make_app()
+        app.ffmpeg = "ffmpeg"
+        app.stop_event.set()
+        with mock.patch.object(app, "start") as start:
+            app.handle_tray("start")
+            start.assert_called_once()
+        app.close()
+
+    def test_instance_signal_delivers_restore_and_stops(self):
+        name = f"Local\\BackgroundsCameraTest_{uuid.uuid4().hex}"
+        signal = b.InstanceSignal(name)
+        messages = queue.Queue()
+        signal.start(messages)
+        try:
+            self.assertTrue(b.show_existing_instance(name))
+            self.assertEqual(messages.get(timeout=3), ("tray", "show"))
+        finally:
+            signal.close()
+        self.assertFalse(signal.thread.is_alive())
 
 
 @unittest.skipUnless(os.name == "nt", "Windows shared memory is required")

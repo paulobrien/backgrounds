@@ -19,11 +19,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import BinaryIO
 
-from PIL import Image, ImageOps, ImageTk
+import pystray
+from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 WIDTH, HEIGHT = 1280, 720
 PREVIEW_SIZE = (720, 405)
@@ -31,6 +33,7 @@ MAP_SIZE = 16 + WIDTH * HEIGHT * 4
 MAP_NAME = "Local\\BackgroundsCameraFrame"
 MUTEX_NAME = "Local\\BackgroundsCameraMutex"
 INSTANCE_MUTEX_NAME = "Local\\BackgroundsCameraInstance"
+INSTANCE_EVENT_NAME = "Local\\BackgroundsCameraShowWindow"
 VIRTUAL_CAMERA_NAME = "Backgrounds Virtual Camera"
 MAGIC = 0x42474331
 TEST_SOURCE = "Test pattern (no camera)"
@@ -38,7 +41,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 ERROR_ALREADY_EXISTS = 183
 SETTINGS_PATH = Path(os.environ.get("APPDATA") or Path.home()) / "BackgroundsCamera" / "settings.json"
 DEFAULT_SETTINGS = dict(camera=None, overlay_path=None, x=100, y=100, size=25, opacity=100,
-                        mirror=False, grayscale=False, show_preview=True)
+                        mirror=False, grayscale=False, show_preview=True, start_minimized=False)
 SETTING_RANGES = dict(x=(0, 100), y=(0, 100), size=(5, 100), opacity=(0, 100))
 
 
@@ -58,7 +61,7 @@ def load_settings(path: Path = SETTINGS_PATH) -> dict:
         value = saved.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             settings[key] = min(high, max(low, round(value)))
-    for key in ("mirror", "grayscale", "show_preview"):
+    for key in ("mirror", "grayscale", "show_preview", "start_minimized"):
         if isinstance(saved.get(key), bool):
             settings[key] = saved[key]
     return settings
@@ -98,6 +101,75 @@ def acquire_instance_lock() -> tuple[ctypes.WinDLL, int] | None:
         kernel.CloseHandle(handle)
         return None
     return kernel, handle
+
+
+def create_app_icon() -> Image.Image:
+    image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((8, 8, 248, 248), radius=52, fill="#233e65")
+    draw.rounded_rectangle((36, 68, 173, 188), radius=25, fill="#f3f6fa")
+    draw.polygon(((174, 103), (218, 78), (218, 178), (174, 153)), fill="#f3f6fa")
+    draw.ellipse((70, 91, 145, 166), fill="#34b5b4")
+    draw.ellipse((86, 107, 129, 150), fill="#233e65")
+    return image
+
+
+class InstanceSignal:
+    def __init__(self, name: str = INSTANCE_EVENT_NAME):
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.CreateEventW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR)
+        self.kernel.CreateEventW.restype = wintypes.HANDLE
+        self.kernel.SetEvent.argtypes = (wintypes.HANDLE,)
+        self.kernel.SetEvent.restype = wintypes.BOOL
+        self.kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        self.kernel.WaitForSingleObject.restype = wintypes.DWORD
+        self.kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.handle = self.kernel.CreateEventW(None, False, False, name)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.stopping = threading.Event()
+        self.thread = None
+
+    def start(self, messages: queue.Queue):
+        def listen():
+            while not self.stopping.is_set():
+                result = self.kernel.WaitForSingleObject(self.handle, 0xFFFFFFFF)
+                if result != 0:
+                    messages.put(("error", f"Could not listen for another app launch (Windows error {ctypes.get_last_error()})."))
+                    return
+                if not self.stopping.is_set():
+                    messages.put(("tray", "show"))
+
+        self.thread = threading.Thread(target=listen, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stopping.set()
+        if self.thread is not None:
+            if not self.kernel.SetEvent(self.handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.thread.join()
+        self.kernel.CloseHandle(self.handle)
+
+
+def show_existing_instance(name: str = INSTANCE_EVENT_NAME) -> bool:
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenEventW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel.OpenEventW.restype = wintypes.HANDLE
+    kernel.SetEvent.argtypes = (wintypes.HANDLE,)
+    kernel.SetEvent.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    deadline = time.monotonic() + 5
+    while True:
+        handle = kernel.OpenEventW(0x0002, False, name)  # EVENT_MODIFY_STATE
+        if handle:
+            try:
+                return bool(kernel.SetEvent(handle))
+            finally:
+                kernel.CloseHandle(handle)
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 class FrameWriter:
@@ -286,6 +358,22 @@ class Application:
         self.mirror = tk.BooleanVar(value=settings["mirror"])
         self.grayscale = tk.BooleanVar(value=settings["grayscale"])
         self.show_preview = tk.BooleanVar(value=settings["show_preview"])
+        self.start_minimized = tk.BooleanVar(value=settings["start_minimized"])
+        self.start_minimize_pending = settings["start_minimized"]
+        self.window_visible = True
+        self.tray_ready = False
+        self.tray_started = threading.Event()
+
+        icon_image = create_app_icon()
+        self.window_icon = ImageTk.PhotoImage(icon_image)
+        root.iconphoto(True, self.window_icon)
+        menu = pystray.Menu(
+            pystray.MenuItem("Show", lambda: self.messages.put(("tray", "show")), default=True),
+            pystray.MenuItem("Start", lambda: self.messages.put(("tray", "start"))),
+            pystray.MenuItem("Stop", lambda: self.messages.put(("tray", "stop"))),
+            pystray.MenuItem("Exit", lambda: self.messages.put(("tray", "exit"))),
+        )
+        self.tray = pystray.Icon("BackgroundsCamera", icon_image, "Backgrounds Camera", menu)
 
         outer = ttk.Frame(root, padding=12)
         outer.pack(fill="both", expand=True)
@@ -321,6 +409,7 @@ class Application:
         ttk.Checkbutton(effects, text="Mirror video", variable=self.mirror, command=self.update_options).pack(side="left")
         ttk.Checkbutton(effects, text="Grayscale video", variable=self.grayscale, command=self.update_options).pack(side="left", padx=12)
         ttk.Checkbutton(effects, text="Show preview", variable=self.show_preview, command=self.toggle_preview).pack(side="left")
+        ttk.Checkbutton(effects, text="Start minimized", variable=self.start_minimized).pack(side="left", padx=12)
         self.preview_label = ttk.Label(outer, anchor="center")
         self.preview_label.pack(fill="both", expand=True, pady=4)
         ttk.Label(outer, textvariable=self.status, wraplength=720).pack(fill="x", pady=(4, 0))
@@ -329,12 +418,60 @@ class Application:
             self.load_overlay(settings["overlay_path"], show_errors=False)
         self.update_options()
         root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Unmap>", self.on_unmap)
         root.after(50, self.poll)
         if self.ffmpeg:
             self.refresh()
         else:
             self.status.set("FFmpeg not found. Install FFmpeg and make sure ffmpeg.exe is on PATH.")
             self.start_button.configure(state="disabled")
+        self.tray.run_detached(setup=self.setup_tray)
+
+    def setup_tray(self, icon):
+        try:
+            icon.visible = True
+            self.messages.put(("tray", "ready"))
+        except Exception as error:
+            self.messages.put(("error", f"Could not show the system tray icon: {error}"))
+        finally:
+            self.tray_started.set()
+
+    def on_unmap(self, event):
+        if event.widget is self.root and self.root.state() == "iconic" and self.tray_ready:
+            self.hide_window()
+
+    def hide_window(self):
+        self.window_visible = False
+        self.update_options()
+        self.clear_preview()
+        self.root.withdraw()
+
+    def show_window(self):
+        self.window_visible = True
+        self.update_options()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def handle_tray(self, action: str):
+        if action == "ready":
+            self.tray_ready = True
+            if self.start_minimize_pending:
+                self.hide_window()
+            self.start_minimize_pending = False
+        elif action == "show":
+            self.start_minimize_pending = False
+            self.show_window()
+        elif action == "start":
+            if self.ffmpeg and (not self.worker or not self.worker.is_alive()):
+                self.start()
+        elif action == "stop":
+            if self.worker and self.worker.is_alive() and not self.stop_event.is_set():
+                self.stop()
+        elif action == "exit":
+            self.close()
+            return True
+        return False
 
     def update_options(self):
         for label, variable, heading in self.slider_labels:
@@ -342,12 +479,13 @@ class Application:
         with self.options_lock:
             self.options = dict(overlay=self.overlay, x=self.x.get(), y=self.y.get(), size=self.size.get(),
                                 opacity=self.opacity.get(), mirror=self.mirror.get(), grayscale=self.grayscale.get(),
-                                preview=self.show_preview.get())
+                                preview=self.show_preview.get() and self.window_visible)
 
     def current_settings(self) -> dict:
         return dict(camera=self.saved_camera or self.camera.get(), overlay_path=self.overlay_path,
                     x=self.x.get(), y=self.y.get(), size=self.size.get(), opacity=self.opacity.get(),
-                    mirror=self.mirror.get(), grayscale=self.grayscale.get(), show_preview=self.show_preview.get())
+                    mirror=self.mirror.get(), grayscale=self.grayscale.get(), show_preview=self.show_preview.get(),
+                    start_minimized=self.start_minimized.get())
 
     def clear_preview(self):
         text = "Preview appears here" if self.show_preview.get() else "Preview hidden"
@@ -516,7 +654,7 @@ class Application:
     def poll(self):
         try:
             image = self.preview.get_nowait()
-            if self.show_preview.get():
+            if self.show_preview.get() and self.window_visible:
                 self.preview_image = ImageTk.PhotoImage(image)
                 self.preview_label.configure(image=self.preview_image, text="")
         except queue.Empty:
@@ -524,7 +662,10 @@ class Application:
         try:
             while True:
                 kind, value = self.messages.get_nowait()
-                if kind == "cameras":
+                if kind == "tray":
+                    if self.handle_tray(value):
+                        return
+                elif kind == "cameras":
                     choices = [TEST_SOURCE] + value
                     self.camera_box.configure(values=choices)
                     if self.saved_camera in choices:
@@ -553,8 +694,11 @@ class Application:
     def close(self):
         try:
             save_settings(self.current_settings())
-        except OSError:
-            pass
+        except OSError as error:
+            messagebox.showerror("Could not save settings", str(error))
+        if not self.tray_started.wait(timeout=5):
+            messagebox.showerror("Backgrounds Camera", "The system tray failed to start.")
+        self.tray.stop()
         self.stop()
         # Termination releases the pipe read; wait for the worker before unmapping memory.
         if self.worker and self.worker.is_alive():
@@ -568,22 +712,29 @@ def main():
     if os.name != "nt":
         raise SystemExit("Backgrounds Camera requires Windows.")
     lock = acquire_instance_lock()
-    root = tk.Tk()
     if lock is None:
-        root.withdraw()
-        messagebox.showinfo("Backgrounds Camera", "Backgrounds Camera is already running.")
-        root.destroy()
+        if not show_existing_instance():
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Backgrounds Camera", "The running application could not be opened.")
+            root.destroy()
         return
     kernel, handle = lock
+    signal = None
     try:
+        signal = InstanceSignal()
+        root = tk.Tk()
         try:
-            Application(root)
+            app = Application(root)
+            signal.start(app.messages)
         except Exception as error:
             messagebox.showerror("Backgrounds could not start", str(error))
             root.destroy()
             return
         root.mainloop()
     finally:
+        if signal is not None:
+            signal.close()
         kernel.CloseHandle(handle)
 
 
