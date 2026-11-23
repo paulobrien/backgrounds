@@ -18,6 +18,8 @@ if (Test-Path -LiteralPath $targetDll -PathType Leaf) {
     try { Remove-Item -LiteralPath $targetDll -Force }
     catch { throw "Could not remove the DLL. Close Teams and other apps using the camera, then retry. $($_.Exception.Message)" }
 }
+$installedLicense = Join-Path $installDirectory 'MICROSOFT-WINDOWS-CLASSIC-SAMPLES-LICENSE.txt'
+if (Test-Path -LiteralPath $installedLicense -PathType Leaf) { Remove-Item -LiteralPath $installedLicense -Force }
 if ((Test-Path -LiteralPath $installDirectory -PathType Container) -and @(Get-ChildItem -LiteralPath $installDirectory -Force).Count -eq 0) {
     Remove-Item -LiteralPath $installDirectory
 }

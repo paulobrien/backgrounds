@@ -25,7 +25,7 @@ cmake -S native/virtual-camera -B build/virtual-camera -A x64 "-DDIRECTSHOW_BASE
 cmake --build build/virtual-camera --config Release
 ```
 
-The output is `build/virtual-camera/Release/BackgroundsCamera.dll`. The release build uses the static MSVC runtime. Microsoft’s sample source has its own license; retain its license and comply with it when distributing a build.
+The output is `build/virtual-camera/Release/BackgroundsCamera.dll`. The release build uses the static MSVC runtime. To update the prebuilt DLL distributed with this repository, copy the release DLL to `dist/BackgroundsCamera.dll`, test it, and commit it alongside the corresponding source changes. The Microsoft sample code licence is included in `dist/MICROSOFT-WINDOWS-CLASSIC-SAMPLES-LICENSE.txt` and must accompany the distributed DLL.
 
 ## Install for your user
 
@@ -35,7 +35,7 @@ Close applications that may be using the camera, open a **normal**, non-administ
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-camera.ps1
 ```
 
-The script copies the DLL to `%LOCALAPPDATA%\BackgroundsCamera` and registers it for the current Windows user. If using a prebuilt DLL at another location, pass `-DllPath` followed by its path. The script does not itself install the companion app or its dependencies; see the repository README for those steps.
+The script copies the included `dist/BackgroundsCamera.dll` and its licence notice to `%LOCALAPPDATA%\BackgroundsCamera` and registers the DLL for the current Windows user. To install a newly built DLL before updating the distributed copy, pass `-DllPath build/virtual-camera/Release/BackgroundsCamera.dll`. The script does not itself install the companion app or its dependencies; see the repository README for those steps.
 
 Start the companion app and its camera feed, then start or restart Teams and select **Backgrounds Virtual Camera** in its device settings. Try a Teams preview and a test call; a black picture means no frame is being published or the producer cannot be accessed. If the camera does not appear, the application might not support this DirectShow device or may need restarting. Do not select Backgrounds Virtual Camera as the app's physical input: that creates a feedback loop.
 

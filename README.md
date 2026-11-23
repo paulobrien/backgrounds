@@ -8,7 +8,7 @@ An early Windows 11 prototype that captures a webcam, composites an image and si
 
 - Windows 11, 64-bit, with camera access enabled. No administrator permission should be needed for the per-user camera installation; organisation policies may prevent it.
 - Python 3 with Tkinter and Pillow, and FFmpeg with DirectShow and `lavfi` support available on `PATH`. If Python or FFmpeg is missing, obtain a per-user installation from their official distributors; this repository does not bundle them. Check with `py -3 --version` and `ffmpeg -version`.
-- The compiled filter at `build\virtual-camera\Release\BackgroundsCamera.dll`. Build products are not included in the Git repository: after a fresh checkout, follow [the native build instructions](native/virtual-camera/README.md), or obtain a separately supplied prebuilt DLL. Building may require tools that need administrator access to install; installing the resulting camera for your user does not. The filter is x64 only, so 32-bit camera clients cannot load it.
+- The compiled filter in `dist\BackgroundsCamera.dll` is included in the repository. The filter is x64 only, so 32-bit camera clients cannot load it. See [the native build instructions](native/virtual-camera/README.md) to rebuild it; installing build tools may require administrator access, but installing the camera for your user does not.
 
 ## Install for your Windows account
 
@@ -19,7 +19,7 @@ py -3 -m pip install --user Pillow
 powershell -ExecutionPolicy Bypass -File .\scripts\install-camera.ps1
 ```
 
-The camera installer registers a native DLL for the current user; consult the script and native README for the location and uninstall procedure. It does not install Python or FFmpeg. Python packages downloaded by pip and FFmpeg have their own licenses.
+The camera installer registers the included native DLL for the current user; consult the script and native README for the location and uninstall procedure. It does not install Python or FFmpeg. Python packages downloaded by pip and FFmpeg have their own licenses. The bundled DLL includes Microsoft DirectShow sample code; its [licence notice](dist/MICROSOFT-WINDOWS-CLASSIC-SAMPLES-LICENSE.txt) accompanies it.
 
 ## Use
 
