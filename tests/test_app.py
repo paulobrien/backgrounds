@@ -6,6 +6,7 @@ import queue
 import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -54,6 +55,27 @@ class LatestFrameReaderTests(unittest.TestCase):
         reader.drain()
         stop.set()
         self.assertIsNone(reader.take())
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.folder, True)
+
+    def test_round_trip(self):
+        path = self.folder / "nested" / "settings.json"
+        saved = dict(b.DEFAULT_SETTINGS, camera="Integrated Webcam", overlay_path="C:\\logo.png", x=10,
+                     size=40, mirror=True, show_preview=False)
+        b.save_settings(saved, path)
+        self.assertEqual(b.load_settings(path), saved)
+
+    def test_missing_corrupt_and_invalid_values_fall_back_to_defaults(self):
+        path = self.folder / "settings.json"
+        self.assertEqual(b.load_settings(path), b.DEFAULT_SETTINGS)
+        path.write_text("{not json", encoding="utf-8")
+        self.assertEqual(b.load_settings(path), b.DEFAULT_SETTINGS)
+        path.write_text('{"size": 500, "opacity": "high", "mirror": 1, "camera": 3, "x": true}', encoding="utf-8")
+        self.assertEqual(b.load_settings(path), dict(b.DEFAULT_SETTINGS, size=100))
 
 
 @unittest.skipUnless(os.name == "nt", "Windows shared memory is required")

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+import json
 import mmap
 import os
 from pathlib import Path
@@ -29,6 +30,39 @@ MUTEX_NAME = "Local\\BackgroundsCameraMutex"
 MAGIC = 0x42474331
 TEST_SOURCE = "Test pattern (no camera)"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+SETTINGS_PATH = Path(os.environ.get("APPDATA") or Path.home()) / "BackgroundsCamera" / "settings.json"
+DEFAULT_SETTINGS = dict(camera=None, overlay_path=None, x=100, y=100, size=25, opacity=100,
+                        mirror=False, grayscale=False, show_preview=True)
+SETTING_RANGES = dict(x=(0, 100), y=(0, 100), size=(5, 100), opacity=(0, 100))
+
+
+def load_settings(path: Path = SETTINGS_PATH) -> dict:
+    """Return saved settings merged over defaults, ignoring missing, invalid or out-of-range values."""
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return settings
+    if not isinstance(saved, dict):
+        return settings
+    for key in ("camera", "overlay_path"):
+        if isinstance(saved.get(key), str):
+            settings[key] = saved[key]
+    for key, (low, high) in SETTING_RANGES.items():
+        value = saved.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            settings[key] = min(high, max(low, round(value)))
+    for key in ("mirror", "grayscale", "show_preview"):
+        if isinstance(saved.get(key), bool):
+            settings[key] = saved[key]
+    return settings
+
+
+def save_settings(settings: dict, path: Path = SETTINGS_PATH):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
 
 
 class FrameWriter:
@@ -172,19 +206,23 @@ class Application:
         self.stop_event = threading.Event()
         self.process_lock = threading.Lock()
         self.options_lock = threading.Lock()
+        settings = load_settings()
+        self.saved_camera = settings["camera"]
         self.overlay = None
+        self.overlay_path = None
         self.options = {}
         self.messages = queue.Queue()
         self.preview = queue.Queue(maxsize=1)
         self.camera = tk.StringVar(value=TEST_SOURCE)
         self.status = tk.StringVar(value="Choose a camera and click Start.")
         self.overlay_label = tk.StringVar(value="No overlay selected")
-        self.x = tk.IntVar(value=100)
-        self.y = tk.IntVar(value=100)
-        self.size = tk.IntVar(value=25)
-        self.opacity = tk.IntVar(value=100)
-        self.mirror = tk.BooleanVar(value=False)
-        self.grayscale = tk.BooleanVar(value=False)
+        self.x = tk.IntVar(value=settings["x"])
+        self.y = tk.IntVar(value=settings["y"])
+        self.size = tk.IntVar(value=settings["size"])
+        self.opacity = tk.IntVar(value=settings["opacity"])
+        self.mirror = tk.BooleanVar(value=settings["mirror"])
+        self.grayscale = tk.BooleanVar(value=settings["grayscale"])
+        self.show_preview = tk.BooleanVar(value=settings["show_preview"])
 
         outer = ttk.Frame(root, padding=12)
         outer.pack(fill="both", expand=True)
@@ -216,9 +254,13 @@ class Application:
         effects.pack(fill="x", pady=6)
         ttk.Checkbutton(effects, text="Mirror video", variable=self.mirror, command=self.update_options).pack(side="left")
         ttk.Checkbutton(effects, text="Grayscale video", variable=self.grayscale, command=self.update_options).pack(side="left", padx=12)
-        self.preview_label = ttk.Label(outer, text="Preview appears here", anchor="center")
+        ttk.Checkbutton(effects, text="Show preview", variable=self.show_preview, command=self.toggle_preview).pack(side="left")
+        self.preview_label = ttk.Label(outer, anchor="center")
         self.preview_label.pack(fill="both", expand=True, pady=4)
         ttk.Label(outer, textvariable=self.status, wraplength=900).pack(fill="x", pady=(4, 0))
+        self.clear_preview()
+        if settings["overlay_path"]:
+            self.load_overlay(settings["overlay_path"], show_errors=False)
         self.update_options()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(50, self.poll)
@@ -231,22 +273,44 @@ class Application:
     def update_options(self):
         with self.options_lock:
             self.options = dict(overlay=self.overlay, x=self.x.get(), y=self.y.get(), size=self.size.get(),
-                                opacity=self.opacity.get(), mirror=self.mirror.get(), grayscale=self.grayscale.get())
+                                opacity=self.opacity.get(), mirror=self.mirror.get(), grayscale=self.grayscale.get(),
+                                preview=self.show_preview.get())
 
-    def choose_overlay(self):
-        path = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
-        if not path:
-            return
+    def current_settings(self) -> dict:
+        return dict(camera=self.camera.get(), overlay_path=self.overlay_path, x=self.x.get(), y=self.y.get(),
+                    size=self.size.get(), opacity=self.opacity.get(), mirror=self.mirror.get(),
+                    grayscale=self.grayscale.get(), show_preview=self.show_preview.get())
+
+    def clear_preview(self):
+        text = "Preview appears here" if self.show_preview.get() else "Preview hidden"
+        self.preview_label.configure(image="", text=text)
+        self.preview_image = None
+
+    def toggle_preview(self):
+        self.update_options()
+        self.clear_preview()
+
+    def load_overlay(self, path: str, show_errors: bool = True):
         try:
             with Image.open(path) as image:
                 self.overlay = image.convert("RGBA")
+            self.overlay_path = str(Path(path).resolve())
             self.overlay_label.set(Path(path).name)
             self.update_options()
         except (OSError, ValueError) as error:
-            messagebox.showerror("Could not open image", str(error))
+            if show_errors:
+                messagebox.showerror("Could not open image", str(error))
+            else:
+                self.status.set(f"Saved overlay could not be loaded: {path}")
+
+    def choose_overlay(self):
+        path = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
+        if path:
+            self.load_overlay(path)
 
     def remove_overlay(self):
         self.overlay = None
+        self.overlay_path = None
         self.overlay_label.set("No overlay selected")
         self.update_options()
 
@@ -303,7 +367,7 @@ class Application:
                     options = self.options.copy()
                 image = composite(Image.frombytes("RGB", (WIDTH, HEIGHT), data), options, overlay_cache)
                 self.writer.write(image)
-                if frames % 3 == 0:
+                if options.get("preview", True) and frames % 3 == 0:
                     image.thumbnail((800, 450), Image.Resampling.BILINEAR)
                     try:
                         self.preview.get_nowait()
@@ -367,23 +431,28 @@ class Application:
     def poll(self):
         try:
             image = self.preview.get_nowait()
-            self.preview_image = ImageTk.PhotoImage(image)
-            self.preview_label.configure(image=self.preview_image, text="")
+            if self.show_preview.get():
+                self.preview_image = ImageTk.PhotoImage(image)
+                self.preview_label.configure(image=self.preview_image, text="")
         except queue.Empty:
             pass
         try:
             while True:
                 kind, value = self.messages.get_nowait()
                 if kind == "cameras":
-                    self.camera_box.configure(values=[TEST_SOURCE] + value)
-                    if value and self.camera.get() == TEST_SOURCE:
-                        self.camera.set(value[0])
+                    choices = [TEST_SOURCE] + value
+                    self.camera_box.configure(values=choices)
+                    if self.saved_camera in choices:
+                        self.camera.set(self.saved_camera)
+                    elif self.camera.get() not in choices or (value and self.camera.get() == TEST_SOURCE):
+                        self.camera.set(value[0] if value else TEST_SOURCE)
+                    self.saved_camera = None
                     if not self.worker or not self.worker.is_alive():
                         self.status.set(f"Found {len(value)} camera(s). Choose a camera and click Start.")
                 elif kind == "stopped":
                     self.start_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
-                    self.preview_label.configure(image="", text="Preview appears here")
+                    self.clear_preview()
                     if not self.status.get().startswith("Capture failed") and not self.status.get().startswith("Capture stopped."):
                         self.status.set(value)
                 else:
@@ -393,6 +462,10 @@ class Application:
         self.root.after(50, self.poll)
 
     def close(self):
+        try:
+            save_settings(self.current_settings())
+        except OSError:
+            pass
         self.stop()
         # Termination releases the pipe read; wait for the worker before unmapping memory.
         if self.worker and self.worker.is_alive():
