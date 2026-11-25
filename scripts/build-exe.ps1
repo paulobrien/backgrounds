@@ -1,8 +1,5 @@
 [CmdletBinding()]
-param(
-    [switch] $BundleFfmpeg,
-    [string] $FfmpegPath
-)
+param()
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $entry = Join-Path $repoRoot 'app\backgrounds.py'
@@ -34,21 +31,18 @@ $args = @(
     '--specpath', $workDir
 )
 
-if ($BundleFfmpeg -and -not $FfmpegPath) {
-    $cmd = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
-    if (-not $cmd) {
-        throw 'Could not find ffmpeg.exe on PATH. Pass -FfmpegPath <path-to-ffmpeg.exe>.'
+$helper = Join-Path $repoRoot 'build\capture\Release\BackgroundsCapture.exe'
+if (Test-Path -LiteralPath $helper -PathType Leaf) {
+    Copy-Item -LiteralPath $helper -Destination (Join-Path $distDir 'BackgroundsCapture.exe') -Force
+} else {
+    $helper = Join-Path $distDir 'BackgroundsCapture.exe'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        throw 'BackgroundsCapture.exe not found. Build native\capture first (see README).'
     }
-    $FfmpegPath = $cmd.Source
 }
-
-if ($FfmpegPath) {
-    if (-not (Test-Path -LiteralPath $FfmpegPath -PathType Leaf)) {
-        throw "ffmpeg.exe not found: $FfmpegPath"
-    }
-    $args += @('--add-binary', "$FfmpegPath;.")
-}
-
+$args += @('--add-binary', "$helper;.")
+$args += @('--add-data', "$(Join-Path $repoRoot 'app\matting_patch.bin');.")
+$args += @('--collect-binaries', 'onnxruntime')
 $args += $entry
 
 & py @args

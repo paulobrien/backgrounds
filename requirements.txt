@@ -1,2 +1,4 @@
 Pillow>=9.1
 pystray>=0.19.5,<0.20
+numpy>=1.26
+onnxruntime-directml>=1.17

@@ -1,7 +1,7 @@
 """Backgrounds: camera capture, simple effects and PNG overlay preview.
 
 The virtual-camera filter consumes the composited frames via named shared memory.
-Requires Windows, Python 3, Pillow and an FFmpeg build with DirectShow support.
+Requires Windows, Python 3, Pillow and the BackgroundsCapture.exe Media Foundation helper.
 """
 from __future__ import annotations
 
@@ -13,18 +13,19 @@ import os
 from pathlib import Path
 import queue
 import re
-import shutil
 import struct
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 from typing import BinaryIO
 
 import pystray
 from PIL import Image, ImageDraw, ImageOps, ImageTk
+
+from matting import BACKGROUND_MODES, BackgroundProcessor
 
 WIDTH, HEIGHT = 1280, 720
 PREVIEW_SIZE = (720, 405)
@@ -40,8 +41,12 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 ERROR_ALREADY_EXISTS = 183
 SETTINGS_PATH = Path(os.environ.get("APPDATA") or Path.home()) / "BackgroundsCamera" / "settings.json"
 DEFAULT_SETTINGS = dict(camera=None, overlay_path=None, x=100, y=100, size=25, opacity=100,
-                        mirror=False, grayscale=False, show_preview=True, start_minimized=False)
-SETTING_RANGES = dict(x=(0, 100), y=(0, 100), size=(5, 100), opacity=(0, 100))
+                        mirror=False, grayscale=False, show_preview=True, start_minimized=False,
+                        background="off", background_image_path=None, background_colour="#2a6f4e",
+                        blur=60, quality="best")
+SETTING_RANGES = dict(x=(0, 100), y=(0, 100), size=(5, 100), opacity=(0, 100), blur=(0, 100))
+BACKGROUND_LABELS = dict(off="None", blur="Blur", image="Image", colour="Colour")
+QUALITY_LABELS = dict(best="Best quality", fast="Faster")
 
 
 def load_settings(path: Path = SETTINGS_PATH) -> dict:
@@ -53,9 +58,15 @@ def load_settings(path: Path = SETTINGS_PATH) -> dict:
         return settings
     if not isinstance(saved, dict):
         return settings
-    for key in ("camera", "overlay_path"):
+    for key in ("camera", "overlay_path", "background_image_path"):
         if isinstance(saved.get(key), str):
             settings[key] = saved[key]
+    if saved.get("background") in BACKGROUND_MODES:
+        settings["background"] = saved["background"]
+    if saved.get("quality") in QUALITY_LABELS:
+        settings["quality"] = saved["quality"]
+    if isinstance(saved.get("background_colour"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", saved["background_colour"]):
+        settings["background_colour"] = saved["background_colour"]
     for key, (low, high) in SETTING_RANGES.items():
         value = saved.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -73,18 +84,23 @@ def save_settings(settings: dict, path: Path = SETTINGS_PATH):
     os.replace(temporary, path)
 
 
-def find_ffmpeg() -> str | None:
-    """Locate ffmpeg.exe in a bundled executable directory or on PATH."""
+CAPTURE_HELPER = "BackgroundsCapture.exe"
+
+
+def find_capture_helper() -> str | None:
+    """Locate the capture helper bundled in the executable, beside it, or in a repository build."""
     candidates: list[Path] = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        candidates.append(Path(meipass) / "ffmpeg.exe")
+        candidates.append(Path(meipass) / CAPTURE_HELPER)
     if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / "ffmpeg.exe")
+        candidates.append(Path(sys.executable).resolve().parent / CAPTURE_HELPER)
+    repository = Path(__file__).resolve().parent.parent
+    candidates += [repository / "build" / "capture" / "Release" / CAPTURE_HELPER, repository / "dist" / CAPTURE_HELPER]
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
-    return shutil.which("ffmpeg")
+    return None
 
 
 def acquire_instance_lock() -> tuple[ctypes.WinDLL, int] | None:
@@ -295,40 +311,26 @@ class OverlayCache:
         return self.image
 
 
-def list_cameras(ffmpeg: str) -> list[str]:
-    # Device listing intentionally returns an error status in some FFmpeg builds.
-    result = subprocess.run([ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-                            capture_output=True, text=True, errors="replace", timeout=12,
-                            creationflags=NO_WINDOW)
-    names = []
-    for line in (result.stdout + result.stderr).splitlines():
-        if "Alternative name" in line or "(audio)" in line:
-            continue
-        match = re.search(r'\] "(.*?)" \((?:video|none)\)', line)
-        if match and match.group(1).casefold() != VIRTUAL_CAMERA_NAME.casefold():
-            names.append(match.group(1))
-    return list(dict.fromkeys(names))
+def list_cameras(helper: str) -> list[str]:
+    result = subprocess.run([helper, "--list"], capture_output=True, timeout=12, creationflags=NO_WINDOW)
+    if result.returncode != 0:
+        raise OSError(result.stderr.decode("utf-8", "replace").strip() or "camera listing failed")
+    names = [line.strip() for line in result.stdout.decode("utf-8", "replace").splitlines()]
+    return list(dict.fromkeys(name for name in names
+                              if name and name.casefold() != VIRTUAL_CAMERA_NAME.casefold()))
 
 
-def build_ffmpeg_command(ffmpeg: str, camera: str, request_mode: bool = True) -> list[str]:
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
-    if camera == TEST_SOURCE:
-        command += ["-re", "-f", "lavfi", "-i", f"testsrc=size={WIDTH}x{HEIGHT}:rate=30"]
-    else:
-        # Keep the real-time buffer small. FFmpeg drops new frames when this buffer is full, so a
-        # large buffer can retain seconds of stale video after a stall.
-        command += ["-thread_queue_size", "1", "-rtbufsize", "1M", "-f", "dshow"]
-        if request_mode:
-            command += ["-video_size", f"{WIDTH}x{HEIGHT}", "-framerate", "30"]
-        command += ["-i", "video=" + camera]
-    command += ["-vf", f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2",
-                "-fps_mode", "passthrough", "-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1"]
-    return command
+def build_capture_command(helper: str, camera: str) -> list[str]:
+    """Return a command that streams letterboxed WIDTHxHEIGHT RGBA frames to stdout."""
+    return [helper, "--test"] if camera == TEST_SOURCE else [helper, "--camera", camera]
 
 
-def composite(image: Image.Image, options: dict, overlay_cache: OverlayCache | None = None) -> Image.Image:
+def composite(image: Image.Image, options: dict, overlay_cache: OverlayCache | None = None,
+              background: BackgroundProcessor | None = None) -> Image.Image:
     if options["mirror"]:
         image = ImageOps.mirror(image)
+    if background is not None:
+        image = background.process(image, options)
     if options["grayscale"]:
         image = ImageOps.grayscale(image).convert(image.mode)
     overlay = options.get("overlay")
@@ -346,7 +348,7 @@ class Application:
         root.title("Backgrounds Camera")
         root.geometry("990x720")
         root.minsize(760, 600)
-        self.ffmpeg = find_ffmpeg()
+        self.helper = find_capture_helper()
         self.writer = FrameWriter()
         try:
             self._init_ui(root)
@@ -381,6 +383,13 @@ class Application:
         self.show_preview = tk.BooleanVar(value=settings["show_preview"])
         self.start_minimized = tk.BooleanVar(value=settings["start_minimized"])
         self.start_minimize_pending = settings["start_minimized"]
+        self.background = tk.StringVar(value=BACKGROUND_LABELS[settings["background"]])
+        self.quality = tk.StringVar(value=QUALITY_LABELS[settings["quality"]])
+        self.blur = tk.IntVar(value=settings["blur"])
+        self.background_colour = settings["background_colour"]
+        self.background_image = None
+        self.background_image_path = None
+        self.background_image_label = tk.StringVar(value="No background image")
         self.window_visible = True
         self.tray_ready = False
         self.tray_started = threading.Event()
@@ -431,20 +440,37 @@ class Application:
         ttk.Checkbutton(effects, text="Grayscale video", variable=self.grayscale, command=self.update_options).pack(side="left", padx=12)
         ttk.Checkbutton(effects, text="Show preview", variable=self.show_preview, command=self.toggle_preview).pack(side="left")
         ttk.Checkbutton(effects, text="Start minimized", variable=self.start_minimized).pack(side="left", padx=12)
+        background_row = ttk.Frame(outer)
+        background_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(background_row, text="Background:").pack(side="left")
+        ttk.Combobox(background_row, textvariable=self.background, state="readonly", width=8,
+                     values=list(BACKGROUND_LABELS.values())).pack(side="left", padx=6)
+        self.background.trace_add("write", lambda *_: self.update_options())
+        ttk.Label(background_row, text="Blur:").pack(side="left", padx=(6, 0))
+        ttk.Scale(background_row, from_=0, to=100, variable=self.blur, length=120,
+                  command=lambda _: self.update_options()).pack(side="left", padx=4)
+        ttk.Button(background_row, text="Background image…", command=self.choose_background_image).pack(side="left", padx=6)
+        ttk.Button(background_row, text="Colour…", command=self.choose_background_colour).pack(side="left")
+        ttk.Combobox(background_row, textvariable=self.quality, state="readonly", width=12,
+                     values=list(QUALITY_LABELS.values())).pack(side="left", padx=6)
+        self.quality.trace_add("write", lambda *_: self.update_options())
+        ttk.Label(background_row, textvariable=self.background_image_label).pack(side="left", padx=4)
         self.preview_label = ttk.Label(outer, anchor="center")
         self.preview_label.pack(fill="both", expand=True, pady=4)
         ttk.Label(outer, textvariable=self.status, wraplength=720).pack(fill="x", pady=(4, 0))
         self.clear_preview()
         if settings["overlay_path"]:
             self.load_overlay(settings["overlay_path"], show_errors=False)
+        if settings["background_image_path"]:
+            self.load_background_image(settings["background_image_path"], show_errors=False)
         self.update_options()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Unmap>", self.on_unmap)
         root.after(50, self.poll)
-        if self.ffmpeg:
+        if self.helper:
             self.refresh()
         else:
-            self.status.set("FFmpeg not found. Install FFmpeg and make sure ffmpeg.exe is on PATH.")
+            self.status.set(f"{CAPTURE_HELPER} not found. Build it from native\\capture (see README).")
             self.start_button.configure(state="disabled")
         self.tray.run_detached(setup=self.setup_tray)
 
@@ -484,7 +510,7 @@ class Application:
             self.start_minimize_pending = False
             self.show_window()
         elif action == "start":
-            if self.ffmpeg and (not self.worker or not self.worker.is_alive()):
+            if self.helper and (not self.worker or not self.worker.is_alive()):
                 self.start()
         elif action == "stop":
             if self.worker and self.worker.is_alive() and not self.stop_event.is_set():
@@ -494,19 +520,29 @@ class Application:
             return True
         return False
 
+    @staticmethod
+    def key_for(labels: dict, label: str) -> str:
+        return next(key for key, value in labels.items() if value == label)
+
     def update_options(self):
         for label, variable, heading in self.slider_labels:
             heading.configure(text=f"{label}: {variable.get()}")
         with self.options_lock:
             self.options = dict(overlay=self.overlay, x=self.x.get(), y=self.y.get(), size=self.size.get(),
                                 opacity=self.opacity.get(), mirror=self.mirror.get(), grayscale=self.grayscale.get(),
-                                preview=self.show_preview.get() and self.window_visible)
+                                preview=self.show_preview.get() and self.window_visible,
+                                background=self.key_for(BACKGROUND_LABELS, self.background.get()),
+                                quality=self.key_for(QUALITY_LABELS, self.quality.get()), blur=self.blur.get(),
+                                background_image=self.background_image, background_colour=self.background_colour)
 
     def current_settings(self) -> dict:
         return dict(camera=self.saved_camera or self.camera.get(), overlay_path=self.overlay_path,
                     x=self.x.get(), y=self.y.get(), size=self.size.get(), opacity=self.opacity.get(),
                     mirror=self.mirror.get(), grayscale=self.grayscale.get(), show_preview=self.show_preview.get(),
-                    start_minimized=self.start_minimized.get())
+                    start_minimized=self.start_minimized.get(),
+                    background=self.key_for(BACKGROUND_LABELS, self.background.get()),
+                    background_image_path=self.background_image_path, background_colour=self.background_colour,
+                    blur=self.blur.get(), quality=self.key_for(QUALITY_LABELS, self.quality.get()))
 
     def clear_preview(self):
         text = "Preview appears here" if self.show_preview.get() else "Preview hidden"
@@ -542,13 +578,41 @@ class Application:
         self.overlay_label.set("No overlay selected")
         self.update_options()
 
+    def load_background_image(self, path: str, show_errors: bool = True):
+        try:
+            with Image.open(path) as image:
+                self.background_image = image.convert("RGB")
+            self.background_image_path = str(Path(path).resolve())
+            self.background_image_label.set(Path(path).name)
+            self.update_options()
+        except (OSError, ValueError) as error:
+            if show_errors:
+                messagebox.showerror("Could not open image", str(error))
+            else:
+                self.startup_warning = f"Saved background image could not be loaded: {path}"
+                self.status.set(self.startup_warning)
+
+    def choose_background_image(self):
+        path = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
+        if path:
+            self.load_background_image(path)
+            if self.background_image_path:
+                self.background.set(BACKGROUND_LABELS["image"])
+
+    def choose_background_colour(self):
+        _, colour = colorchooser.askcolor(color=self.background_colour, title="Background colour")
+        if colour:
+            self.background_colour = colour
+            self.background.set(BACKGROUND_LABELS["colour"])
+            self.update_options()
+
     def refresh(self):
-        if not self.ffmpeg:
+        if not self.helper:
             return
         self.status.set("Searching for cameras…")
         def run():
             try:
-                self.messages.put(("cameras", list_cameras(self.ffmpeg)))
+                self.messages.put(("cameras", list_cameras(self.helper)))
             except (OSError, subprocess.TimeoutExpired) as error:
                 self.messages.put(("error", f"Could not enumerate cameras: {error}"))
         threading.Thread(target=run, daemon=True).start()
@@ -564,19 +628,12 @@ class Application:
         self.worker.start()
 
     def capture(self, camera: str):
-        attempts = [True, False] if camera != TEST_SOURCE else [False]
         overlay_cache = OverlayCache()
+        background = BackgroundProcessor(notify=lambda message: self.messages.put(("status", message)))
         try:
-            for index, request_mode in enumerate(attempts):
-                if self.stop_event.is_set():
-                    break
-                frames, detail = self._run_ffmpeg(build_ffmpeg_command(self.ffmpeg, camera, request_mode), overlay_cache)
-                if frames > 0 or self.stop_event.is_set():
-                    if not self.stop_event.is_set():
-                        self.messages.put(("error", "Capture stopped. " + (detail or "Check the camera is connected and not in use.")))
-                    break
-                if index == len(attempts) - 1:
-                    self.messages.put(("error", "Capture stopped. " + (detail or "Check the camera is connected and not in use.")))
+            _, detail = self._run_capture(build_capture_command(self.helper, camera), overlay_cache, background)
+            if not self.stop_event.is_set():
+                self.messages.put(("error", "Capture stopped. " + (detail or "Check the camera is connected and not in use.")))
         except (OSError, ValueError, RuntimeError) as error:
             self.messages.put(("error", f"Capture failed: {error}"))
         finally:
@@ -586,14 +643,15 @@ class Application:
                 pass
             self.messages.put(("stopped", "Capture stopped."))
 
-    def _run_ffmpeg(self, command: list[str], overlay_cache: OverlayCache) -> tuple[int, str]:
+    def _run_capture(self, command: list[str], overlay_cache: OverlayCache,
+                    background: BackgroundProcessor) -> tuple[int, str]:
         reader_thread = None
         error_thread = None
         frames = 0
         detail = ""
         try:
             proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
-            # Drain stderr continuously so FFmpeg never blocks, while keeping memory bounded.
+            # Drain stderr continuously so the helper never blocks, while keeping memory bounded.
             error_log = HeadLog(proc.stderr)
             error_thread = threading.Thread(target=error_log.drain, daemon=True)
             error_thread.start()
@@ -612,7 +670,13 @@ class Application:
                     break
                 with self.options_lock:
                     options = self.options.copy()
-                image = composite(Image.frombytes("RGBA", (WIDTH, HEIGHT), data), options, overlay_cache)
+                image = Image.frombytes("RGBA", (WIDTH, HEIGHT), data)
+                try:
+                    image = composite(image, options, overlay_cache, background)
+                except Exception as error:  # Model or GPU failure: report once and continue without it.
+                    self.messages.put(("error", f"Background effect unavailable: {error}"))
+                    background = None
+                    image = composite(image, options, overlay_cache)
                 self.writer.write(image)
                 if options.get("preview", True) and frames % 3 == 0:
                     image.thumbnail(PREVIEW_SIZE, Image.Resampling.BILINEAR)
