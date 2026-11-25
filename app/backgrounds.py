@@ -17,7 +17,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -258,6 +257,26 @@ class LatestFrameReader:
             return None
 
 
+class HeadLog:
+    """Drain a pipe continuously, keeping only its first bytes for error reporting."""
+
+    def __init__(self, pipe: BinaryIO, limit: int = 3000):
+        self.pipe = pipe
+        self.limit = limit
+        self.data = bytearray()
+
+    def drain(self):
+        try:
+            while chunk := self.pipe.read1(65536):
+                if len(self.data) < self.limit:
+                    self.data += chunk[:self.limit - len(self.data)]
+        except (OSError, ValueError):
+            pass
+
+    def text(self) -> str:
+        return bytes(self.data).decode("utf-8", "replace").strip()
+
+
 class OverlayCache:
     def __init__(self):
         self.source = None
@@ -296,7 +315,9 @@ def build_ffmpeg_command(ffmpeg: str, camera: str, request_mode: bool = True) ->
     if camera == TEST_SOURCE:
         command += ["-re", "-f", "lavfi", "-i", f"testsrc=size={WIDTH}x{HEIGHT}:rate=30"]
     else:
-        command += ["-thread_queue_size", "1", "-rtbufsize", "16M", "-f", "dshow"]
+        # Keep the real-time buffer small. FFmpeg drops new frames when this buffer is full, so a
+        # large buffer can retain seconds of stale video after a stall.
+        command += ["-thread_queue_size", "1", "-rtbufsize", "1M", "-f", "dshow"]
         if request_mode:
             command += ["-video_size", f"{WIDTH}x{HEIGHT}", "-framerate", "30"]
         command += ["-i", "video=" + camera]
@@ -566,14 +587,16 @@ class Application:
             self.messages.put(("stopped", "Capture stopped."))
 
     def _run_ffmpeg(self, command: list[str], overlay_cache: OverlayCache) -> tuple[int, str]:
-        error_file = None
         reader_thread = None
+        error_thread = None
         frames = 0
         detail = ""
         try:
-            # Capture stderr without blocking the FFmpeg process or hiding useful startup errors.
-            error_file = tempfile.TemporaryFile(mode="w+b")
-            proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=error_file, creationflags=NO_WINDOW)
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
+            # Drain stderr continuously so FFmpeg never blocks, while keeping memory bounded.
+            error_log = HeadLog(proc.stderr)
+            error_thread = threading.Thread(target=error_log.drain, daemon=True)
+            error_thread.start()
             reader = LatestFrameReader(proc.stdout, WIDTH * HEIGHT * 4, self.stop_event)
             with self.process_lock:
                 self.proc = proc
@@ -605,8 +628,8 @@ class Application:
                 if frames == 1:
                     self.messages.put(("status", f"Streaming. Select {VIRTUAL_CAMERA_NAME} in your video application."))
             if not self.stop_event.is_set():
-                error_file.seek(0)
-                detail = error_file.read(3000).decode("utf-8", "replace").strip()
+                error_thread.join(timeout=3)
+                detail = error_log.text()
             return frames, detail
         finally:
             with self.process_lock:
@@ -625,9 +648,10 @@ class Application:
                     proc.wait()
                 if reader_thread is not None:
                     reader_thread.join()
+                if error_thread is not None:
+                    error_thread.join(timeout=3)
                 proc.stdout.close()
-            if error_file:
-                error_file.close()
+                proc.stderr.close()
 
     def stop(self):
         self.stop_event.set()

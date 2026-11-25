@@ -82,6 +82,15 @@ class LatestFrameReaderTests(unittest.TestCase):
         self.assertEqual(result, [None])
 
 
+class HeadLogTests(unittest.TestCase):
+    def test_drains_whole_pipe_but_keeps_only_head(self):
+        pipe = BytesIO(b"startup error\n" + b"x" * 200000)
+        log = b.HeadLog(pipe, limit=20)
+        log.drain()
+        self.assertEqual(pipe.read(), b"")
+        self.assertEqual(log.text(), "startup error\nxxxxxx")
+
+
 class CameraDiscoveryTests(unittest.TestCase):
     def test_list_cameras_filters_audio_alternatives_and_virtual_camera(self):
         sample_output = "\n".join([

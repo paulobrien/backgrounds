@@ -108,7 +108,13 @@ public:
         if (mutex) CloseHandle(mutex);
         if (mapping) CloseHandle(mapping);
         if (!copied) ZeroMemory(output, kBytes);
-        REFERENCE_TIME start = next_, end = start + kFrameTime;
+        // Stamp live frames with the graph's stream time so clients render them now. A free-running
+        // counter can drift from the graph clock and make clients queue frames for later.
+        CRefTime streamTime;
+        FILTER_STATE state = State_Stopped;
+        REFERENCE_TIME start = SUCCEEDED(m_pFilter->GetState(0, &state)) && state == State_Running &&
+                m_pFilter->StreamTime(streamTime) == S_OK ? static_cast<REFERENCE_TIME>(streamTime) : next_;
+        REFERENCE_TIME end = start + kFrameTime;
         next_ = end;
         sample->SetTime(&start, &end);
         sample->SetActualDataLength(kBytes);
